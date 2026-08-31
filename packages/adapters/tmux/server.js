@@ -38,7 +38,8 @@ createServer(async (request, response) => {
       const turnId = String(body.turn_id || '');
       const transcript = String(body.transcript || '').trim();
       if (!turnId || !transcript) return json(response, 400, { error: 'turn_id and transcript are required' });
-      inject(transcript);
+      const callback = `pai-voice-reply --turn-id ${turnId} --text "<your final reply>"`;
+      inject(`[PaiVoice call turn: ${turnId}]\n${transcript}\n\nWhen you have finished your reply, call:\n${callback}`);
       const reply = await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => { pending.delete(turnId); reject(new Error('terminal reply timeout')); }, 120000);
         pending.set(turnId, { resolve: (value) => { clearTimeout(timeout); resolve(value); } });

@@ -75,6 +75,8 @@ PaiVoice 不存在对所有人都正确的一组数值。以下都必须依据�
 
 最小本地启动：先安装 `packages/realtime-core/requirements.txt`，配置自己的服务器环境变量，再运行 `python packages/realtime-core/server.py`。默认 `mock` 模式不调用任何云服务；接入 Groq、ElevenLabs 或 OpenAI 前，请阅读 [密钥与语音隐私](docs/SECRETS.md)。
 
+终端整合提供完整可运行代码与最小接入说明：[Claude CLI / tmux](docs/CLAUDE-TMUX.md) · [Codex CLI / tmux](docs/CODEX-TMUX.md)。
+
 ## 许可
 
 本项目采用 [GNU AGPL-3.0](LICENSE)。可以使用、修改与商用；若将修改版通过网络向用户提供服务，须向这些用户提供相应源码。第三方模型服务、账号权限、密钥和个人数据不包含在本许可内。

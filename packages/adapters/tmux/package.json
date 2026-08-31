@@ -2,5 +2,6 @@
   "name": "@pai-voice/tmux-adapter",
   "private": true,
   "type": "module",
+  "bin": { "pai-voice-reply": "reply.js" },
   "scripts": { "start": "node server.js" }
 }
