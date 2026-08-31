@@ -1,0 +1,6 @@
+{
+  "name": "@pai-voice/tmux-adapter",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" }
+}

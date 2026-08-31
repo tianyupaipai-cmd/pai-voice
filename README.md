@@ -67,6 +67,14 @@ PaiVoice 不存在对所有人都正确的一组数值。以下都必须依据�
 4. 实现 `openai-realtime` Adapter，作为原生全双工选项。
 5. 用模拟模型和假音频完成本地开发示例。
 
+## 现已包含的主体代码
+
+- [`packages/web-client/voice-call.js`](packages/web-client/voice-call.js)：无依赖浏览器通话客户端；PCM 捕获、VAD、回声抑制、流式音频队列、温和打断与实时状态事件。
+- [`packages/realtime-core/server.py`](packages/realtime-core/server.py)：可运行的 WebSocket 通话核心；供应商可替换的 ASR、Adapter 与 TTS 管线。
+- [`packages/adapters/tmux`](packages/adapters/tmux)：把已转录的话安全粘贴给用户自己掌控的 tmux 窗口，并等待其 hook 回传回复的适配器。
+
+最小本地启动：先安装 `packages/realtime-core/requirements.txt`，配置自己的服务器环境变量，再运行 `python packages/realtime-core/server.py`。默认 `mock` 模式不调用任何云服务；接入 Groq、ElevenLabs 或 OpenAI 前，请阅读 [密钥与语音隐私](docs/SECRETS.md)。
+
 ## 许可
 
 本项目采用 [GNU AGPL-3.0](LICENSE)。可以使用、修改与商用；若将修改版通过网络向用户提供服务，须向这些用户提供相应源码。第三方模型服务、账号权限、密钥和个人数据不包含在本许可内。
