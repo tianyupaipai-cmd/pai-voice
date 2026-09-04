@@ -1,7 +1,7 @@
 /* 实时语音/视频通话 · 浏览器端（无依赖 ES module）
  *
  * 一条媒体流三种用途：分析流（VAD）、识别流（推给后端转写）、——原声不归档（隐私：音频不落盘）。
- * 即使顾川在说话，麦克风也继续听：她一开口就 interrupt，他立刻停。
+ * 即使机在说话，麦克风也继续听：她一开口就 interrupt，他立刻停。
  *
  * 用法：
  *   const call = new VoiceCall({ url: 'wss://your-pai-voice.example/voice/ws', video: false, on: {...} });
@@ -53,7 +53,7 @@ export class VoiceCall {
       floor: 0.006,        // 最低噪声底
       gain: 3.2,           // 进入阈值 = max(floor, 噪声底 * gain)
       exitRatio: 0.62,     // 结束阈值 = 进入阈值 * 这个（双阈值，防止悬在临界卡住）
-      speakingGain: 2.8,   // 顾川说话时再提高门槛，降低扬声器误触
+      speakingGain: 2.8,   // 机说话时再提高门槛，降低扬声器误触
       watchdogMs: 1600,    // 这么久没有一块声音超过进入阈值 → 强制收尾（AGC 把环境音抬高也不会卡）
     }, vad);
 
