@@ -1,0 +1,4 @@
+aiohttp>=3.10
+numpy>=1.26
+websockets>=14.0
+Pillow>=10   # 视频通话：画面变化检测（可选，没装就每帧都当变了）

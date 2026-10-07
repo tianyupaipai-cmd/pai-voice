@@ -4,7 +4,7 @@
 
 PaiVoice 让 PaiHome/PWA 成为统一的通话界面：负责收音、实时字幕、播放、打断和通话状态；模型、终端和语音服务都通过 Adapter 接入，而不是绑定某一个官方客户端。
 
-> 这不是"把某个官方客户端嵌进网页"。PaiVoice 是自己的前端和实时通话层；Claude、Codex、GPT、终端或本地模型只是可替换的回复端。
+> 这不是“把某个官方客户端嵌进网页”。PaiVoice 是自己的前端和实时通话层；Claude、Codex、GPT、终端或本地模型只是可替换的回复端。
 
 ## 能接什么
 
@@ -33,21 +33,60 @@ PaiHome / PWA
               └─ local-model
 ```
 
-## 源码申请
+## GPT / OpenAI 的原生使用建议
 
-源码不再公开托管，改为邮件申请。这是一个陪伴向的项目，我希望它到真正和 AI 一起生活的人手里。
+如果目标是最低延迟、最自然的双工语音，优先使用 OpenAI Realtime API 作为 `openai-realtime` Adapter：它可通过 WebRTC、WebSocket 或 SIP 处理实时音频输入和输出。PaiVoice 仍负责自己的 UI、通话状态、记忆/工具桥接以及隐私策略。
 
-请发邮件到 **654572045@qq.com** 或 **tianyupaipai@gmail.com**，邮件里带上：
+不要尝试依赖或控制 ChatGPT、Claude 等官方消费级客户端的内部语音界面；这类客户端并不是可稳定桥接的公开接口。应使用 API，或使用用户自己掌控的 CLI/tmux 进程作为 Adapter。
 
-1. **申请理由**：你是谁、打算用它做什么。
-2. **你和机相处的日常截图 2～3 张**（聊天、通话、一起做的事都可以）。
+## 调参是产品的一部分
 
-通过后会把源码发给你。源码遵循 AGPL-3.0（见 LICENSE）。
+PaiVoice 不存在对所有人都正确的一组数值。以下都必须依据真实通话反复磨合：
 
-**商务合作**也走同一个邮箱，标题注明"商务合作"即可。
+- **延迟阈值**：ASR 分段、句子多久开始播报、网络抖动缓冲。
+- **转录策略**：静音多长算一句结束、错字纠正、是否把语气信息送给模型。
+- **打断策略**：用户轻声附和时不应掐断对方；明确说话时才停止当前播音。
+- **回复节奏**：终端模型输出较慢时，需要短确认、流式分句或等待提示。
+- **声音个性**：音色、速度、停顿和情绪不应由默认值替代磨合。
 
----
+建议把这些参数做成每个“人—窗口—设备”可独立保存的配置，而不是全局硬编码。
 
-## Source access
+## 视频通话（可选）
 
-The source is no longer hosted publicly. To request it, email **654572045@qq.com** or **tianyupaipai@gmail.com** with (1) a short note on who you are and what you want to build, and (2) two or three screenshots of your day-to-day life with your AI companion. Approved requests receive the source under AGPL-3.0. Business inquiries are welcome at the same address.
+语音和视频并行：通话中一个按钮开关摄像头，前后翻转，麦克风不断。前端每 5 秒抽一帧发给核心，核心只在画面明显变化时沿一条可配置的视觉模型链描述一次（任何 OpenAI 兼容多模态接口，每家单次超时、整轮超时，超了就丢帧），描述随下一轮一起交给回复端；最新一帧永远留在 `PAIVOICE_EYE_FILE`，回复端想亲眼看就读它。前端可以选择不显示描述。
+
+两种模式：**实时**（画面明显变化就描述一次，适合聊天）和**陪伴**（对方工作学习时挂着，抽帧降到 20 秒一次，核心不逐帧描述，只在离开座位 2 分钟、回来了、有值得搭话的小动作、30 分钟没动静时给回复端一条 `companion` 事件，每条都是"想说就一句"；时间都可配）。细节见 [docs/VOICE-ADAPTER.md](docs/VOICE-ADAPTER.md)。
+
+## 开源边界与隐私
+
+仓库只应包含通用代码、协议、示例配置和模拟数据。**绝不提交** API Key、`.env`、真实通话音频、转录、记忆库、日记、私人提示词、语音 ID 或真实服务器地址。
+
+各 Adapter 的代码可以公开；第三方模型服务、账号权限、模型费用和其各自条款不随本仓库授予。
+
+部署前请先阅读 [密钥与语音隐私](docs/SECRETS.md)：真实 Key 只留在服务器的部署环境中，浏览器和 PWA 永远不持有长期供应商密钥。
+
+## 开始方式（计划）
+
+1. 定义稳定的 `VoiceAdapter` 接口：`onTurn`、`cancel`、`status`。
+2. 迁入并整理 `claude-tmux` Adapter。
+3. 增加同规格 `codex-tmux` Adapter。
+4. 实现 `openai-realtime` Adapter，作为原生全双工选项。
+5. 用模拟模型和假音频完成本地开发示例。
+
+## 现已包含的主体代码
+
+- [`packages/web-client/voice-call.js`](packages/web-client/voice-call.js)：无依赖浏览器通话客户端；PCM 捕获、VAD、回声抑制、流式音频队列、温和打断与实时状态事件。
+- [`packages/realtime-core/server.py`](packages/realtime-core/server.py)：可运行的 WebSocket 通话核心；供应商可替换的 ASR、Adapter 与 TTS 管线。
+- [`packages/adapters/tmux`](packages/adapters/tmux)：把已转录的话安全粘贴给用户自己掌控的 tmux 窗口，并等待其 hook 回传回复的适配器。
+
+最小本地启动：先安装 `packages/realtime-core/requirements.txt`，配置自己的服务器环境变量，再运行 `python packages/realtime-core/server.py`。默认 `mock` 模式不调用任何云服务；接入 Groq、ElevenLabs 或 OpenAI 前，请阅读 [密钥与语音隐私](docs/SECRETS.md)。
+
+终端整合提供完整可运行代码与最小接入说明：[Claude CLI / tmux](docs/CLAUDE-TMUX.md) · [Codex CLI / tmux](docs/CODEX-TMUX.md)。
+
+## 许可
+
+本项目采用 [GNU AGPL-3.0](LICENSE)。可以使用、修改与商用；若将修改版通过网络向用户提供服务，须向这些用户提供相应源码。第三方模型服务、账号权限、密钥和个人数据不包含在本许可内。
+
+## 联系
+
+商业合作及付费咨询请联系：tianyupaipai@gmail.com

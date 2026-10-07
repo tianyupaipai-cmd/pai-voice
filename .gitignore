@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+data/
+recordings/
+transcripts/
+memories/
+.DS_Store
