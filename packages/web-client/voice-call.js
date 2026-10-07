@@ -68,6 +68,9 @@ export class VoiceCall {
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
     this.video = null; this._frameTimer = null; this.canvas = null;
     this.videoMode = 'live';   // live 每 5 秒一帧 / companion 陪伴模式每 20 秒一帧，核心只在离开/回来/小动作/太久没动静时通知回复端
+                               // / screen 屏幕共享：约 2 秒看一眼，画面或字幕变了才发，核心每几秒把几帧串成一段
+    this.source = 'camera';    // 画面来源：camera 摄像头 / screen 屏幕共享
+    this.cameraMode = 'live';  // 屏幕共享前摄像头用的模式，关屏幕共享后回到它
     this.facing = 'user';          // 前置 user / 后置 environment
     this.callSessionId = null; this.stats = { turns: 0, firstAudioMs: null };
     this._turnSentAt = 0;
@@ -214,8 +217,9 @@ export class VoiceCall {
     this.video.srcObject = new MediaStream([track]);
     await this.video.play().catch(() => {});
     this.wantVideo = true;
+    if (this.source === 'screen') { this.source = 'camera'; this.videoMode = this.cameraMode; this.emit('videoMode', this.videoMode); }
     this._startFrames();
-    this._send({ type: 'video', on: true });
+    this._send({ type: 'video', on: true, source: 'camera' });
     if (this.videoMode !== 'live') this._send({ type: 'video_mode', mode: this.videoMode });
     this.emit('video', this.video);
     return this.video;
@@ -227,17 +231,57 @@ export class VoiceCall {
     if (this._frameTimer) { clearInterval(this._frameTimer); this._frameTimer = null; }
     if (this.video) { try { this.video.pause(); this.video.srcObject = null; } catch { /* ignore */ } }
     this.wantVideo = false;
-    this._send({ type: 'video', on: false });
+    const wasScreen = this.source === 'screen';
+    if (wasScreen) { this.source = 'camera'; this.videoMode = this.cameraMode; this.emit('videoMode', this.videoMode); }
+    this._send({ type: 'video', on: false, source: wasScreen ? 'screen' : 'camera' });
     this.emit('video', null);
+  }
+
+  /** 只有电脑浏览器能共享屏幕；iPhone / iPad 的 Safari 没有 getDisplayMedia。 */
+  static canShareScreen() {
+    return typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia && !/iPhone|iPad|iPod/i.test(navigator.userAgent);
+  }
+
+  /** 共享屏幕：浏览器弹窗选窗口 / 整个屏幕；画面替代摄像头走同一条抽帧管线，麦克风照旧。必须在用户手势里调。 */
+  async enableScreen() {
+    if (!this.stream || !this.ctx) throw new Error('还没接通');
+    if (!VoiceCall.canShareScreen()) throw new Error('这个浏览器不支持共享屏幕');
+    const disp = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'always', frameRate: { ideal: 5, max: 10 } }, audio: false });
+    const track = disp.getVideoTracks()[0];
+    if (!track) throw new Error('没拿到屏幕画面');
+    this._stopVideoTracks();
+    this.stream.addTrack(track);
+    track.onended = () => { if (this.source === 'screen') this.disableVideo(); };   // 点了浏览器的"停止共享"
+    if (!this.video) {
+      this.video = document.createElement('video');
+      this.video.muted = true; this.video.playsInline = true; this.video.autoplay = true;
+    }
+    this.video.srcObject = new MediaStream([track]);
+    await this.video.play().catch(() => {});
+    this.wantVideo = true;
+    if (this.source !== 'screen') this.cameraMode = this.videoMode;
+    this.source = 'screen';
+    this.videoMode = 'screen';
+    this._lastThumb = null; this._lastSentAt = 0;
+    this._startFrames();
+    this._send({ type: 'video', on: true, source: 'screen' });
+    this.emit('videoMode', this.videoMode);
+    this.emit('video', this.video);
+    return this.video;
   }
 
   _startFrames() {
     if (this._frameTimer) clearInterval(this._frameTimer);
-    this._frameTimer = setInterval(() => this._pushFrame(), this.videoMode === 'companion' ? 20000 : 5000);
+    this._frameTimer = setInterval(() => this._pushFrame(), this.videoMode === 'companion' ? 20000 : this.source === 'screen' ? 2000 : 5000);
   }
 
   /** 实时 / 陪伴 两种模式，通话中随时切，不用重开摄像头。 */
   setVideoMode(mode) {
+    if (this.source === 'screen') {             // 屏幕共享时固定是 screen：先记下，关了屏幕共享再用
+      this.cameraMode = mode === 'companion' ? 'companion' : 'live';
+      this._send({ type: 'video_mode', mode: this.cameraMode });
+      return;
+    }
     this.videoMode = mode === 'companion' ? 'companion' : 'live';
     if (this._frameTimer) this._startFrames();
     this._send({ type: 'video_mode', mode: this.videoMode });
@@ -417,11 +461,33 @@ export class VoiceCall {
   _pushFrame() {
     if (!this.video || !this.ws || this.ws.readyState !== 1 || this.video.videoWidth === 0) return;
     if (!this.canvas) this.canvas = document.createElement('canvas');
-    const w = 480, h = Math.round(this.video.videoHeight * (w / this.video.videoWidth));
+    const screen = this.source === 'screen';
+    // 屏幕共享：字幕和游戏里的字要看得清，抽 1280 宽；画面没变就不发（回合制游戏、暂停时大部分时间是静止的）
+    const w = screen ? 1280 : 480, h = Math.round(this.video.videoHeight * (w / this.video.videoWidth));
     this.canvas.width = w; this.canvas.height = h;
     this.canvas.getContext('2d').drawImage(this.video, 0, 0, w, h);
-    const dataUrl = this.canvas.toDataURL('image/jpeg', 0.6);
+    if (screen && !this._screenChanged()) return;
+    const dataUrl = this.canvas.toDataURL('image/jpeg', screen ? 0.72 : 0.6);
     this._send({ type: 'frame', data: dataUrl.split(',')[1], ts: Date.now() });
+  }
+
+  /** 屏幕的变化检测：64×36 灰度缩略图和上一帧比，平均差小于 0.3% 就当没变（换一句字幕也要算变了）；每 60 秒至少发一帧保底。 */
+  _screenChanged() {
+    if (!this._thumbCanvas) { this._thumbCanvas = document.createElement('canvas'); this._thumbCanvas.width = 64; this._thumbCanvas.height = 36; }
+    const c = this._thumbCanvas.getContext('2d', { willReadFrequently: true });
+    c.drawImage(this.canvas, 0, 0, 64, 36);
+    const d = c.getImageData(0, 0, 64, 36).data;
+    const cur = new Float32Array(64 * 36);
+    for (let i = 0; i < cur.length; i++) cur[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    const now = Date.now();
+    let changed = true;
+    if (this._lastThumb) {
+      let sum = 0;
+      for (let i = 0; i < cur.length; i++) sum += Math.abs(cur[i] - this._lastThumb[i]);
+      changed = sum / cur.length > 0.003 || now - (this._lastSentAt || 0) > 60000;
+    }
+    if (changed) { this._lastThumb = cur; this._lastSentAt = now; }
+    return changed;
   }
 
   // ------------------------------------------------------------ 挂断

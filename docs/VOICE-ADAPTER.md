@@ -25,11 +25,13 @@ interface VoiceAdapter {
 | 前端 → 核心 | `{"type":"video","on":true|false}` | 开/关摄像头 |
 | 前端 → 核心 | `{"type":"frame","data":"<base64 jpeg>","ts":…}` | 实时模式每 5 秒一帧、陪伴模式每 20 秒一帧，480 宽 |
 | 前端 → 核心 | `{"type":"video_mode","mode":"live"|"companion"}` | 切实时 / 陪伴模式，不用重开摄像头 |
+| 前端 → 核心 | `{"type":"video","on":true,"source":"screen"}` | 开 / 关屏幕共享（`source` 不写就是摄像头） |
 | 核心 → 前端 | `{"type":"video","on":…,"eyes":…,"mode":…}` | 回执；`eyes` 表示服务端配了视觉模型 |
 | 核心 → 前端 | `{"type":"video_mode","mode":…}` | 切模式回执 |
 | 核心 → 前端 | `{"type":"observation","content":"…"}` | 视觉模型的描述（前端可以选择不显示） |
 | 核心 → 适配器 | `POST /event {"type":"camera","on":…,"mode":…,"frame":…}` / `{"type":"saw","text":…,"frame":…}` | 可选；适配器没实现 `/event` 就忽略 |
 | 核心 → 适配器 | `POST /event {"type":"companion","kind":"left"|"back"|"gesture"|"still","text":…,"frame":…}` | 陪伴模式唯一的开口通道，每条都是"想说就一句" |
+| 核心 → 适配器 | `POST /event {"type":"screen","text":…,"frame":…}` | 屏幕共享：每几秒一条，把这几帧串成的一段（字幕原文 + 剧情 / 游戏界面变化） |
 | 核心 → 适配器 | `onTurn` 的 `turn` 多一个 `observation?: string` | 最近一次看到的画面，随这轮一起给 |
 
 原画面：核心把最新一帧写到 `PAIVOICE_EYE_FILE`（默认 `/tmp/paivoice-eye-latest.jpg`），回复端想亲眼看就读它；关摄像头或挂断时删掉。视觉模型走一条可配置的链（任何 OpenAI 兼容多模态接口），单家 `PAIVOICE_VISION_TIMEOUT`、整轮 `PAIVOICE_VISION_TOTAL_TIMEOUT` 超时就丢这一帧。
@@ -44,6 +46,18 @@ interface VoiceAdapter {
 - `still`：`PAIVOICE_COMPANION_STILL_SECONDS`（默认 1800）秒没动静，text 里轮流写"提醒喝口水 / 站起来活动一下"。
 
 模型最少 `PAIVOICE_COMPANION_ASSESS_MIN_SECONDS`（60）秒问一次，没动静也每 `PAIVOICE_COMPANION_ASSESS_MAX_SECONDS`（300）秒保底问一次；像素差门槛是实时模式的 `PAIVOICE_COMPANION_DIFF_MULT`（2）倍。适配器的回复端拿到 `companion` 事件后想说一句就说，不想说也行。
+
+## 屏幕共享（网页端）
+
+电脑浏览器里通话时可以把屏幕（某个窗口或整个屏幕）共享给回复端，一起看剧、打游戏、看网页。画面替代摄像头走同一条抽帧管线，麦克风照旧：
+
+- 前端约 2 秒看一眼屏幕，抽 1280 宽（字幕和游戏里的字要看得清），用 64×36 灰度缩略图和上一帧比，**画面或字幕变了才发**，每 60 秒至少发一帧保底。
+- 核心把这些帧攒着，每 `PAIVOICE_SCREEN_STORY_SECONDS`（10）秒把这段均匀挑最多 `PAIVOICE_SCREEN_STORY_FRAMES`（5）帧，**按顺序一起**交给视觉模型（`PAIVOICE_VISION_STORY_PROMPT`）：是剧就先原样摘出字幕、再一两句串起剧情；是游戏或网页就说界面和这几秒的变化。单看一帧时字幕常常只有半句、剧情接不上，几帧一起看就连贯了。模型不支持一次多张图或失败时，退回只看最后一帧（`PAIVOICE_VISION_SCREEN_PROMPT`）。
+- 结果以 `screen` 事件给适配器、`observation` 给前端。回复端想接话就接一句，不用每条都回。
+- 开屏幕共享时会记下摄像头原来的模式（实时 / 陪伴），停止共享（包括点浏览器自己的"停止共享"）后回到它。
+- iPhone / iPad 的 Safari 没有屏幕共享接口，`VoiceCall.canShareScreen()` 会返回 false，按钮可以直接藏起来。
+
+网页端：`call.enableScreen()` 开屏幕共享（必须在用户点按里调），`call.disableVideo()` 停止。
 
 网页端：`call.enableVideo(facing)` / `call.disableVideo()` / `call.flipCamera()` / `call.setVideoMode('live'|'companion')`，`on.video(el)` 拿到预览用的 `<video>`（把这个元素本身挂进页面，同一路流不要再开第二个元素，iOS 会让第二个黑屏）。麦克风在挂断、连接断开、接通失败三条路上都会真正释放；静音是真停音轨（iOS 的指示灯只认这个）。
 

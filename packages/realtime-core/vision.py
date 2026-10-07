@@ -11,6 +11,7 @@
   PAIVOICE_VISION_DIFF_THRESHOLD=0.06（32×32 灰度平均像素差）  PAIVOICE_VISION_MIN_INTERVAL=8（秒）
   PAIVOICE_VISION_PROMPT  描述提示词（默认见下）
   PAIVOICE_VISION_COMPANION_PROMPT  陪伴模式提示词：只回一行 JSON {present, activity, notable}
+  PAIVOICE_VISION_SCREEN_PROMPT / PAIVOICE_VISION_STORY_PROMPT  屏幕共享模式：单帧 / 多帧串剧情的提示词
 """
 
 from __future__ import annotations
@@ -42,6 +43,23 @@ COMPANION_PROMPT = os.getenv(
     "这是视频通话中从对方摄像头里抽的一帧。对方在工作或学习，你只是安静的观察员。只输出一行 JSON，不要任何别的字："
     '{"present": 画面里有没有人（true/false）, "activity": "在做什么，十个字以内", '
     '"notable": "值得搭话的小动作：伸懒腰、趴桌、揉眼、打哈欠、明显发呆走神、一直玩手机、对镜头笑或摆手之类，十个字以内；正常工作学习就写空字符串"}',
+)
+
+
+SCREEN_PROMPT = os.getenv(
+    "PAIVOICE_VISION_SCREEN_PROMPT",
+    "这是通话中对方共享的电脑屏幕截图。用中文、三句话以内说清画面现在的状态：是什么界面/游戏/视频、正在发生什么、"
+    "屏幕上关键的文字（字幕、选项、对话、数值、提示）。只描述，不评价，不打招呼，不加前缀。",
+)
+
+# 屏幕共享时一次只看一帧，字幕半句、剧情接不上：把这几秒里的几帧按顺序一起给模型，串成一两句
+STORY_PROMPT = os.getenv(
+    "PAIVOICE_VISION_STORY_PROMPT",
+    "这是通话中对方共享的电脑屏幕，下面是按时间顺序的 {n} 张截图，前后大约 {secs} 秒。对方多半在看剧或视频，也可能在玩游戏、看网页。"
+    "如果是剧或视频：先把这几张里的字幕按先后原样摘出来（重复的只写一次，每句用「」括起来），"
+    "再用一两句话把这几秒的剧情串起来：谁、在做什么、什么情绪。"
+    "如果是游戏或网页：说清是什么界面、这几秒里发生了什么变化、屏幕上关键的文字（选项、对话、数值、提示）。"
+    "只描述，不评价，不打招呼，不加前缀，总共不超过五句。",
 )
 
 
@@ -127,7 +145,17 @@ class Eyes:
         self.last_observation = d["activity"] or ("画面里没人" if not d["present"] else None)
         return d
 
-    async def _run(self, session: aiohttp.ClientSession, jpeg: bytes, prompt: str) -> str | None:
+    async def story(self, session: aiohttp.ClientSession, frames: list[bytes], secs: float) -> str | None:
+        """屏幕共享：几帧按顺序一起交给模型（要能一次看多张图），串成这几秒发生的事；失败就退回只看最后一帧。"""
+        if not frames:
+            return None
+        if len(frames) > 1:
+            desc = await self._run(session, frames, STORY_PROMPT.format(n=len(frames), secs=round(secs)))
+            if desc:
+                return desc
+        return await self._run(session, frames[-1], SCREEN_PROMPT)
+
+    async def _run(self, session: aiohttp.ClientSession, jpeg: bytes | list[bytes], prompt: str) -> str | None:
         self._last_desc_at = time.time()
         if self.busy:
             return None
@@ -156,14 +184,14 @@ class Eyes:
         finally:
             self.busy = False
 
-    async def _describe(self, session: aiohttp.ClientSession, jpeg: bytes, backend: dict, prompt: str = PROMPT) -> str:
-        b64 = base64.b64encode(jpeg).decode()
+    async def _describe(self, session: aiohttp.ClientSession, jpeg: bytes | list[bytes], backend: dict, prompt: str = PROMPT) -> str:
+        frames = jpeg if isinstance(jpeg, list) else [jpeg]
         body = {
             "model": backend["model"],
             "max_tokens": 600,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                *({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(f).decode()}} for f in frames),
             ]}],
         }
         async with session.post(f"{backend['base']}/chat/completions", json=body,
