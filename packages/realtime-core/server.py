@@ -115,6 +115,10 @@ COMP_DIFF_MULT = float(os.getenv("PAIVOICE_COMPANION_DIFF_MULT", "2"))          
 # 屏幕共享：前端约 2 秒一帧（画面或字幕变了才发），核心攒着，每 SCREEN_STORY_SECS 秒把这几帧按顺序一起交给模型串一次
 SCREEN_STORY_SECS = float(os.getenv("PAIVOICE_SCREEN_STORY_SECONDS", "10"))
 SCREEN_STORY_FRAMES = int(os.getenv("PAIVOICE_SCREEN_STORY_FRAMES", "5"))
+# 一起看电影（前端 setWatchTitle 告诉了片名）：一分钟一段、多挑几帧、剧情讲足，但每段控字数，省回复端的上下文
+FILM_STORY_SECS = float(os.getenv("PAIVOICE_FILM_STORY_SECONDS", "60"))
+FILM_STORY_FRAMES = int(os.getenv("PAIVOICE_FILM_STORY_FRAMES", "8"))
+FILM_MAX_CHARS = int(os.getenv("PAIVOICE_FILM_MAX_CHARS", "400"))
 
 
 def save_eye_file(jpeg: bytes) -> None:
@@ -163,6 +167,7 @@ class Call:
     screen_buf: list = field(default_factory=list)   # 屏幕共享：上次串完之后攒的 (时间, jpeg)
     screen_story_at: float = 0.0
     camera_mode: str = "live"                 # 切到屏幕共享前摄像头用的模式，关屏幕共享后回到它
+    watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
 
     def companion_reset(self) -> None:
         self.comp = {"present": None, "absent_since": 0.0, "left_reported": False,
@@ -180,28 +185,42 @@ class Call:
 
 SCREEN_INTRO = ("对方共享了屏幕，可能在看剧、玩游戏或看网页，想和你一起看。大约每 {secs} 秒来一条 screen 事件："
                 "把这几秒的几帧串起来说了什么、发生了什么。想接话就自然地接一句，不用每条都回，也别逐条复述画面")
+FILM_INTRO = ("对方共享屏幕和你一起看《{title}》。大约每 {secs} 秒来一条 screen 事件：这段的字幕原文 + 三到五句剧情。"
+              "像坐在旁边一起看那样，想接话就接一句，不用每条都回，也别复述剧情")
+
+
+def clip_text(text: str, limit: int) -> str:
+    """超了就在最近的句末截断；句末离得太远就硬截加省略号。"""
+    if len(text) <= limit:
+        return text
+    cut = max(text.rfind(p, 0, limit) for p in "。！？”」")
+    return text[:cut + 1] if cut > limit // 2 else text[:limit] + "…"
 
 
 async def screen_frame(ws, call: Call, http: aiohttp.ClientSession, jpeg: bytes) -> None:
     """屏幕共享：先攒帧（模型在串上一段时来的帧也留着），到点、模型空闲时把这段挑几帧一起交出去。"""
     now = time.time()
-    call.screen_buf = [*call.screen_buf[-29:], (now, jpeg)]
-    if not call.eyes.enabled or call.eyes.busy or now - call.screen_story_at < SCREEN_STORY_SECS:
+    film = call.watch_title
+    every, frames = (FILM_STORY_SECS, FILM_STORY_FRAMES) if film else (SCREEN_STORY_SECS, SCREEN_STORY_FRAMES)
+    call.screen_buf = [*call.screen_buf[-59:], (now, jpeg)]
+    if not call.eyes.enabled or call.eyes.busy or now - call.screen_story_at < every:
         return
     buf, call.screen_buf = call.screen_buf, []
-    if len(buf) > SCREEN_STORY_FRAMES:            # 多了就均匀挑，首尾都留
-        step = (len(buf) - 1) / (SCREEN_STORY_FRAMES - 1)
-        buf = [buf[round(i * step)] for i in range(SCREEN_STORY_FRAMES)]
+    if len(buf) > frames:                         # 多了就均匀挑，首尾都留
+        step = (len(buf) - 1) / (frames - 1)
+        buf = [buf[round(i * step)] for i in range(frames)]
     call.screen_story_at = now
-    desc = await call.eyes.story(http, [j for _, j in buf], buf[-1][0] - buf[0][0])
+    desc = await call.eyes.story(http, [j for _, j in buf], buf[-1][0] - buf[0][0], title=film or None)
+    if desc and film:
+        desc = clip_text(desc, FILM_MAX_CHARS)
     if desc and call.video and call.video_mode == "screen":
         await send(ws, {"type": "observation", "content": desc})
         await notify_adapter(http, {"type": "screen", "call_session_id": call.id, "text": desc, "frame": EYE_FILE})
 
 
-def companion_intro(mode: str) -> str:
+def companion_intro(mode: str, title: str = "") -> str:
     if mode == "screen":
-        return SCREEN_INTRO.format(secs=round(SCREEN_STORY_SECS))
+        return FILM_INTRO.format(title=title, secs=round(FILM_STORY_SECS)) if title else SCREEN_INTRO.format(secs=round(SCREEN_STORY_SECS))
     if mode != "companion":
         return "对方把摄像头切回实时模式：画面有变化会来 saw 事件"
     return (f"对方开的是陪伴模式：在工作或学习，别主动评论画面。只有离开座位 {COMP_ABSENT_SECS // 60} 分钟、回来了、"
@@ -334,7 +353,17 @@ async def session(ws) -> None:
                     await send(ws, {"type": "video", "on": on, "source": source, "eyes": call.eyes.enabled, "mode": call.video_mode})
                     await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": on, "source": source,
                                                 "mode": call.video_mode, "frame": EYE_FILE if on else None,
-                                                **({"text": companion_intro(call.video_mode)} if on and call.video_mode in ("companion", "screen") else {})})
+                                                **({"text": companion_intro(call.video_mode, call.watch_title)} if on and call.video_mode in ("companion", "screen") else {})})
+            elif kind == "watch":
+                # 一起看电影：{"type":"watch","title":"片名"}；title 空 = 不看了，回到普通屏幕共享
+                title = str(event.get("title") or "").strip()[:60]
+                if title != call.watch_title:
+                    call.watch_title = title
+                    call.screen_buf, call.screen_story_at = [], 0.0
+                    await send(ws, {"type": "watch", "title": title})
+                    if call.video and call.video_mode == "screen":
+                        await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": True, "source": "screen",
+                                                    "mode": "screen", "frame": EYE_FILE, "text": companion_intro("screen", title)})
             elif kind == "video_mode":
                 mode = "companion" if event.get("mode") == "companion" else "live"
                 if call.video_mode == "screen":           # 屏幕共享中切的是摄像头模式：记下，关了屏幕共享再用

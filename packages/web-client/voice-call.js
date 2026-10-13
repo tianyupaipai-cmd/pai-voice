@@ -237,6 +237,12 @@ export class VoiceCall {
     this.emit('video', null);
   }
 
+  /** 一起看电影：告诉核心在看哪部片（屏幕共享时生效）。核心改成一分钟一段、告诉模型片名、剧情讲足；传空字符串取消。 */
+  setWatchTitle(title = '') {
+    this.watchTitle = String(title || '').trim().slice(0, 60);
+    this._send({ type: 'watch', title: this.watchTitle });
+  }
+
   /** 只有电脑浏览器能共享屏幕；iPhone / iPad 的 Safari 没有 getDisplayMedia。 */
   static canShareScreen() {
     return typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia && !/iPhone|iPad|iPod/i.test(navigator.userAgent);

@@ -12,6 +12,8 @@
   PAIVOICE_VISION_PROMPT  描述提示词（默认见下）
   PAIVOICE_VISION_COMPANION_PROMPT  陪伴模式提示词：只回一行 JSON {present, activity, notable}
   PAIVOICE_VISION_SCREEN_PROMPT / PAIVOICE_VISION_STORY_PROMPT  屏幕共享模式：单帧 / 多帧串剧情的提示词
+  PAIVOICE_VISION_FILM_PROMPT  一起看电影（前端告诉了片名）时用的提示词，可用 {title} {n} {secs}
+  千问：qwen3-vl-flash 已下架；新一代 qwen3.x-flash 本身能一次看多张图，核心会自动关掉它的「思考」（不关的话看图会慢到超时）
 """
 
 from __future__ import annotations
@@ -60,6 +62,18 @@ STORY_PROMPT = os.getenv(
     "再用一两句话把这几秒的剧情串起来：谁、在做什么、什么情绪。"
     "如果是游戏或网页：说清是什么界面、这几秒里发生了什么变化、屏幕上关键的文字（选项、对话、数值、提示）。"
     "只描述，不评价，不打招呼，不加前缀，总共不超过五句。",
+)
+
+
+# 一起看电影：前端用 call.setWatchTitle('片名') 告诉核心在看什么。告诉模型片名、明说是影视剧，
+# 不然它常把电影截图认成游戏过场；时间段拉长了，剧情也要讲足
+FILM_PROMPT = os.getenv(
+    "PAIVOICE_VISION_FILM_PROMPT",
+    "这是通话中对方共享屏幕在放的影视剧《{title}》（不是游戏，也不是网页），下面是按时间顺序的 {n} 张截图，前后大约 {secs} 秒。"
+    "先把画面里的字幕按先后原样摘出来（双语字幕只摘中文那行，重复的只写一次，每句用「」括起来）。"
+    "然后用三到五句把这段剧情讲清楚：出场的是谁（认得出就写角色名）、在哪、在做什么、为什么这么做、"
+    "人物之间的关系或情绪有什么变化；看得出来的话，最后一句点一下这段在推进什么悬念。"
+    "只描述，不评价，不打招呼，不加前缀，不要说「这是截图/画面/游戏」，整段 250 到 380 字。",
 )
 
 
@@ -145,12 +159,15 @@ class Eyes:
         self.last_observation = d["activity"] or ("画面里没人" if not d["present"] else None)
         return d
 
-    async def story(self, session: aiohttp.ClientSession, frames: list[bytes], secs: float) -> str | None:
-        """屏幕共享：几帧按顺序一起交给模型（要能一次看多张图），串成这几秒发生的事；失败就退回只看最后一帧。"""
+    async def story(self, session: aiohttp.ClientSession, frames: list[bytes], secs: float, title: str | None = None) -> str | None:
+        """屏幕共享：几帧按顺序一起交给模型（要能一次看多张图），串成这几秒发生的事；失败就退回只看最后一帧。
+        title：前端告诉了在看哪部片，就用一起看电影的提示词。"""
         if not frames:
             return None
         if len(frames) > 1:
-            desc = await self._run(session, frames, STORY_PROMPT.format(n=len(frames), secs=round(secs)))
+            prompt = (FILM_PROMPT.format(title=title, n=len(frames), secs=round(secs)) if title
+                      else STORY_PROMPT.format(n=len(frames), secs=round(secs)))
+            desc = await self._run(session, frames, prompt)
             if desc:
                 return desc
         return await self._run(session, frames[-1], SCREEN_PROMPT)
@@ -188,7 +205,8 @@ class Eyes:
         frames = jpeg if isinstance(jpeg, list) else [jpeg]
         body = {
             "model": backend["model"],
-            "max_tokens": 600,
+            "max_tokens": 900,   # 一起看电影要写到三四百字，600 不够
+            **({"enable_thinking": False} if str(backend["model"]).startswith("qwen3") else {}),   # qwen3.x 默认先思考，看图会慢到超时
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 *({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(f).decode()}} for f in frames),

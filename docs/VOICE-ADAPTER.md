@@ -26,6 +26,7 @@ interface VoiceAdapter {
 | 前端 → 核心 | `{"type":"frame","data":"<base64 jpeg>","ts":…}` | 实时模式每 5 秒一帧、陪伴模式每 20 秒一帧，480 宽 |
 | 前端 → 核心 | `{"type":"video_mode","mode":"live"|"companion"}` | 切实时 / 陪伴模式，不用重开摄像头 |
 | 前端 → 核心 | `{"type":"video","on":true,"source":"screen"}` | 开 / 关屏幕共享（`source` 不写就是摄像头） |
+| 前端 → 核心 | `{"type":"watch","title":"片名"}` | 一起看电影：告诉核心在看哪部片；`title` 空字符串 = 回到普通屏幕共享 |
 | 核心 → 前端 | `{"type":"video","on":…,"eyes":…,"mode":…}` | 回执；`eyes` 表示服务端配了视觉模型 |
 | 核心 → 前端 | `{"type":"video_mode","mode":…}` | 切模式回执 |
 | 核心 → 前端 | `{"type":"observation","content":"…"}` | 视觉模型的描述（前端可以选择不显示） |
@@ -58,6 +59,17 @@ interface VoiceAdapter {
 - iPhone / iPad 的 Safari 没有屏幕共享接口，`VoiceCall.canShareScreen()` 会返回 false，按钮可以直接藏起来。
 
 网页端：`call.enableScreen()` 开屏幕共享（必须在用户点按里调），`call.disableVideo()` 停止。
+
+### 一起看电影
+
+屏幕共享时调 `call.setWatchTitle('片名')`（传空字符串取消）。核心会：
+
+- 改成一分钟一段（`PAIVOICE_FILM_STORY_SECONDS`，默认 60），每段均匀挑 8 帧（`PAIVOICE_FILM_STORY_FRAMES`）；
+- 告诉模型片名、明说是影视剧（不然它常把电影截图认成游戏过场），先摘字幕原文，再用三到五句讲清谁在做什么、为什么、关系和情绪怎么变；
+- 每段最多 `PAIVOICE_FILM_MAX_CHARS` 字（默认 400），超了在句末截断，省回复端的上下文；
+- 开屏幕共享前后都可以设，设了会再给适配器一条带片名说明的 camera 事件。
+
+片子的原声这一版不听：网页端屏幕共享只传画面。片子自带字幕（含烧在画面里的硬字幕）就够跟上剧情。
 
 网页端：`call.enableVideo(facing)` / `call.disableVideo()` / `call.flipCamera()` / `call.setVideoMode('live'|'companion')`，`on.video(el)` 拿到预览用的 `<video>`（把这个元素本身挂进页面，同一路流不要再开第二个元素，iOS 会让第二个黑屏）。麦克风在挂断、连接断开、接通失败三条路上都会真正释放；静音是真停音轨（iOS 的指示灯只认这个）。
 
