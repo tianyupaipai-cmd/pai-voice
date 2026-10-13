@@ -22,6 +22,7 @@ interface VoiceAdapter {
 
 | 方向 | 消息 | 说明 |
 | --- | --- | --- |
+| 前端 → 核心 | `{"type":"start","resume":"<call_session_id>"}` | 断线接回：带上之前的编号，核心在 `PAIVOICE_RESUME_SECONDS` 秒内认得出就接着同一通（回 `state` 带 `resumed: true`） |
 | 前端 → 核心 | `{"type":"video","on":true|false}` | 开/关摄像头 |
 | 前端 → 核心 | `{"type":"frame","data":"<base64 jpeg>","ts":…}` | 实时模式每 5 秒一帧、陪伴模式每 20 秒一帧，480 宽 |
 | 前端 → 核心 | `{"type":"video_mode","mode":"live"|"companion"}` | 切实时 / 陪伴模式，不用重开摄像头 |
@@ -33,6 +34,8 @@ interface VoiceAdapter {
 | 核心 → 适配器 | `POST /event {"type":"camera","on":…,"mode":…,"frame":…}` / `{"type":"saw","text":…,"frame":…}` | 可选；适配器没实现 `/event` 就忽略 |
 | 核心 → 适配器 | `POST /event {"type":"companion","kind":"left"|"back"|"gesture"|"still","text":…,"frame":…}` | 陪伴模式唯一的开口通道，每条都是"想说就一句" |
 | 核心 → 适配器 | `POST /event {"type":"screen","text":…,"frame":…}` | 屏幕共享：每几秒一条，把这几帧串成的一段（字幕原文 + 剧情 / 游戏界面变化） |
+| 核心 → 适配器 | `POST /event {"type":"call_resumed","gap_s":…}` | 断线后接回了同一通（`gap_s` 断了几秒；0 = 手机先连上新的、旧连接被接管） |
+| 核心 → 适配器 | `POST /event {"type":"call_end","reason":"hangup"|"disconnected"}` | 这一通真结束了：按了挂断，或断线后没接回来 |
 | 核心 → 适配器 | `onTurn` 的 `turn` 多一个 `observation?: string` | 最近一次看到的画面，随这轮一起给 |
 
 原画面：核心把最新一帧写到 `PAIVOICE_EYE_FILE`（默认 `/tmp/paivoice-eye-latest.jpg`），回复端想亲眼看就读它；关摄像头或挂断时删掉。视觉模型走一条可配置的链（任何 OpenAI 兼容多模态接口），单家 `PAIVOICE_VISION_TIMEOUT`、整轮 `PAIVOICE_VISION_TOTAL_TIMEOUT` 超时就丢这一帧。
@@ -47,6 +50,16 @@ interface VoiceAdapter {
 - `still`：`PAIVOICE_COMPANION_STILL_SECONDS`（默认 1800）秒没动静，text 里轮流写"提醒喝口水 / 站起来活动一下"。
 
 模型最少 `PAIVOICE_COMPANION_ASSESS_MIN_SECONDS`（60）秒问一次，没动静也每 `PAIVOICE_COMPANION_ASSESS_MAX_SECONDS`（300）秒保底问一次；像素差门槛是实时模式的 `PAIVOICE_COMPANION_DIFF_MULT`（2）倍。适配器的回复端拿到 `companion` 事件后想说一句就说，不想说也行。
+
+## 断线接回
+
+手机切网络、锁屏时连接常会断一下。核心不把它当挂断：
+
+- 连接断了先留着这一通 `PAIVOICE_RESUME_SECONDS` 秒（默认 60）。网页端会自动隔几秒重连、带上 `call_session_id`，接回来就是同一通：编号、摄像头 / 屏幕共享 / 片名这些状态都还在。
+- 手机常常是先连上新的、旧连接过一会儿才断：新连接带着编号来时旧的还挂着，就让新连接接管，旧连接以 4000 关掉，不算挂断。
+- 这一轮回复端还在想的时候断了线：回复会送到接回后的新连接上；断开那几秒里说出的话会丢，不会让整轮报错。
+- 只有按了挂断，或超时没接回，才给适配器一条 `call_end`。
+- 网页端重连中 `mode` 是 `reconnecting`，有 `reconnecting` / `resumed` 事件；超时没接回才 `closed`。
 
 ## 屏幕共享（网页端）
 

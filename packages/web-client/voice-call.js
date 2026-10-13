@@ -7,6 +7,10 @@
  *   const call = new VoiceCall({ url: 'wss://your-pai-voice.example/voice/ws', video: false, on: {...} });
  *   await call.start();   // 必须在用户点击里调用（iOS 需要手势解锁 AudioContext）
  *   call.hangup();
+ *
+ * 断线接回：连接意外断了（手机切网络、锁屏）不算挂，麦克风和画面都留着，每隔几秒重连一次、带上 call_session_id，
+ * 核心在 PAIVOICE_RESUME_SECONDS（默认 60）秒内认得出就接着同一通。重连中 mode = 'reconnecting'，
+ * 有 reconnecting / resumed 事件；超时没接回才 closed。只有按 hangup() 才是真挂。
  */
 
 const WORKLET_SRC = `
@@ -74,6 +78,8 @@ export class VoiceCall {
     this.facing = 'user';          // 前置 user / 后置 environment
     this.callSessionId = null; this.stats = { turns: 0, firstAudioMs: null };
     this._turnSentAt = 0;
+    this.resumeMs = 58000;     // 断线后最多重连这么久（比核心等的 60 秒略短）
+    this._hungUp = false; this._reconnecting = false;
   }
 
   emit(ev, ...a) { try { this.on[ev] && this.on[ev](...a); } catch (e) { console.error(e); } }
@@ -89,6 +95,7 @@ export class VoiceCall {
   }
 
   async _start() {
+    this._hungUp = false;
     this.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     await this.ctx.resume();
     this.stream = await navigator.mediaDevices.getUserMedia({
@@ -141,13 +148,43 @@ export class VoiceCall {
       ws.onopen = () => { this.ws = ws; resolve(); };
       ws.onerror = () => reject(new Error('连不上通话服务'));
       ws.onclose = (e) => {
+        if (this.ws !== ws) return;     // 已经换成新连接了（接回 / 被接管）
         this.ws = null;
         const wasLive = this.mode !== 'idle';
-        this._releaseMedia();        // 连接没了就没有通话了：麦克风、摄像头、音频上下文一起关
+        if (wasLive && !this._hungUp && this.callSessionId && e.code !== 4000) { this._reconnect(); return; }
+        this._releaseMedia();        // 真挂了：麦克风、摄像头、音频上下文一起关
         if (wasLive) { this._setMode('idle'); this.emit('closed', e); }
       };
       ws.onmessage = (e) => this._onMessage(e.data);
     });
+  }
+
+  /** 意外断线：麦克风、画面都留着，隔几秒重连一次、带上 call_session_id，接回就接着同一通。 */
+  async _reconnect() {
+    if (this._reconnecting) return;
+    this._reconnecting = true;
+    this._stopPlayback();
+    this._setMode('reconnecting');
+    this.emit('reconnecting');
+    const deadline = Date.now() + this.resumeMs;
+    let wait = 800;
+    while (!this._hungUp && Date.now() < deadline) {
+      try {
+        await this._connect();
+        this._send({ type: 'start', resume: this.callSessionId, video: !!this.video, sample_rate: 16000 });
+        this._reconnecting = false;
+        this._setMode('listening');
+        this.emit('resumed');
+        return;
+      } catch { /* 还连不上，过一会儿再试 */ }
+      await new Promise((r) => setTimeout(r, wait));
+      wait = Math.min(wait * 1.6, 5000);
+    }
+    this._reconnecting = false;
+    if (this._hungUp) return;
+    this._releaseMedia();
+    this._setMode('idle');
+    this.emit('closed', { code: 1006, reason: '断线后没接回来' });
   }
 
   _send(obj) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj)); }
@@ -376,6 +413,7 @@ export class VoiceCall {
     switch (msg.type) {
       case 'state':
         if (msg.call_session_id) this.callSessionId = msg.call_session_id;
+        if (msg.resumed) this.emit('resumedState', msg);   // 接回后核心那边的画面状态（video / video_mode / watch_title）
         if (msg.tts) this.emit('info', msg);
         if (msg.mode) this._setMode(msg.mode === 'speaking' && !this.playing ? 'thinking' : msg.mode);
         break;
@@ -498,6 +536,7 @@ export class VoiceCall {
 
   // ------------------------------------------------------------ 挂断
   hangup() {
+    this._hungUp = true;
     this._send({ type: 'hangup' });
     this._stopPlayback();
     this._releaseMedia();

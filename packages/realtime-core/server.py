@@ -24,6 +24,7 @@ import aiohttp
 from vision import DIFF_THRESHOLD, Eyes
 import numpy as np
 from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed
 
 SAMPLE_RATE = 16_000
 HOST = os.getenv("PAIVOICE_HOST", "127.0.0.1")
@@ -38,6 +39,8 @@ ELEVEN_VOICE = os.getenv("PAIVOICE_ELEVEN_VOICE_ID", "")
 ADAPTER_URL = os.getenv("PAIVOICE_ADAPTER_URL", "")
 ADAPTER_TOKEN = os.getenv("PAIVOICE_ADAPTER_TOKEN", "")
 MAX_TURN_SECONDS = int(os.getenv("PAIVOICE_MAX_TURN_SECONDS", "60"))
+# 断线接回：连接断了先不算挂，这么多秒内带着 call_session_id 连回来就接着同一通（手机切网络、锁屏常这样）
+RESUME_WINDOW = float(os.getenv("PAIVOICE_RESUME_SECONDS", "60"))
 
 
 def wav(pcm: bytes) -> bytes:
@@ -167,6 +170,10 @@ class Call:
     screen_buf: list = field(default_factory=list)   # 屏幕共享：上次串完之后攒的 (时间, jpeg)
     screen_story_at: float = 0.0
     camera_mode: str = "live"                 # 切到屏幕共享前摄像头用的模式，关屏幕共享后回到它
+    ws: object = None                         # 现在挂在这一通上的连接；断线等接回时是 None
+    detached_at: float = 0.0                  # 连接断开的时间（等接回中）
+    end_task: object = None                   # 等接回的倒计时
+    ended: bool = False
     watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
 
     def companion_reset(self) -> None:
@@ -272,21 +279,60 @@ async def companion_frame(ws, call: Call, http: aiohttp.ClientSession, jpeg: byt
         await nudge("still", f"对方已经 {COMP_STILL_SECS // 60} 分钟没什么动静了，一直在座位上；提醒{tip}")
 
 
+# 正在进行的通话：call_session_id → Call。断线后留 RESUME_WINDOW 秒等接回
+CALLS: dict[str, "Call"] = {}
+
+
 async def send(ws, message: dict) -> None:
-    await ws.send(json.dumps(message, ensure_ascii=False))
+    """连接已经断了（等接回中）就丢掉这条：回复端的话在断线那几秒里说不出去，不该让整轮报错。"""
+    if ws is None:
+        return
+    try:
+        await ws.send(json.dumps(message, ensure_ascii=False))
+    except Exception:  # noqa: BLE001 —— ConnectionClosed 之类
+        pass
+
+
+async def end_call(call: "Call", http: aiohttp.ClientSession | None, reason: str) -> None:
+    """真挂了：挂断键，或者断线后 RESUME_WINDOW 秒没接回。只走一次。"""
+    if call.ended:
+        return
+    call.ended = True
+    CALLS.pop(call.id, None)
+    if call.end_task and call.end_task is not asyncio.current_task():
+        call.end_task.cancel()
+    remove_eye_file()
+    try:
+        if http is not None and not http.closed:
+            await notify_adapter(http, {"type": "call_end", "call_session_id": call.id, "reason": reason})
+        else:
+            async with aiohttp.ClientSession() as h:
+                await notify_adapter(h, {"type": "call_end", "call_session_id": call.id, "reason": reason})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def end_later(call: "Call") -> None:
+    try:
+        await asyncio.sleep(RESUME_WINDOW)
+    except asyncio.CancelledError:
+        return
+    if call.ws is None and not call.ended:
+        await end_call(call, None, "disconnected")
 
 
 async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, supplied_text: str = "") -> None:
+    # 发给 call.ws 而不是 ws：这一轮还在想的时候断线接回了，回复要送到新连接上
     if not pcm and not supplied_text:
-        await send(ws, {"type": "nothing_heard"})
+        await send(call.ws, {"type": "nothing_heard"})
         return
     turn_id = uuid.uuid4().hex
     try:
         transcript = supplied_text or await transcribe(http, pcm)
         if not transcript:
-            await send(ws, {"type": "nothing_heard"})
+            await send(call.ws, {"type": "nothing_heard"})
             return
-        await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
+        await send(call.ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
         turn = {"call_session_id": call.id, "turn_id": turn_id, "transcript": transcript}
         if call.video and call.eyes.last_observation:
             turn["observation"] = call.eyes.last_observation      # 最近一次看到的画面，随这轮一起给回复端
@@ -295,107 +341,141 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             return
         call.generation += 1
         generation = call.generation
-        await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
+        await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
         audio = await synthesize(http, reply)
         if audio and generation == call.generation:
-            await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
-            await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
-        await send(ws, {"type": "generation_end", "generation_id": generation})
+            await send(call.ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
+            await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
+        await send(call.ws, {"type": "generation_end", "generation_id": generation})
     except Exception as error:  # do not serialize credentials or provider bodies
-        await send(ws, {"type": "error", "error": str(error)})
+        await send(call.ws, {"type": "error", "error": str(error)})
 
 
 async def session(ws) -> None:
     call = Call()
+    explicit = False
     async with aiohttp.ClientSession() as http:
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                if call.active:
-                    call.audio.extend(raw)
-                continue
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            kind = event.get("type")
-            if kind == "start":
-                if TOKEN and event.get("token") != TOKEN:
-                    await send(ws, {"type": "error", "error": "Unauthorized"})
-                    return
-                await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
-            elif kind == "speech_start":
-                call.begin_turn()
-            elif kind == "speech_end":
-                pcm = call.end_turn()
-                await send(ws, {"type": "state", "mode": "thinking"})
-                await answer_turn(ws, call, http, pcm)
-                await send(ws, {"type": "state", "mode": "listening"})
-            elif kind == "text":
-                await send(ws, {"type": "state", "mode": "thinking"})
-                await answer_turn(ws, call, http, b"", str(event.get("text", "")))
-                await send(ws, {"type": "state", "mode": "listening"})
-            elif kind == "interrupt":
-                call.generation += 1
-                await send(ws, {"type": "interrupted"})
-            elif kind == "video":
-                on = bool(event.get("on"))
-                source = "screen" if event.get("source") == "screen" else "camera"
-                if on and source == "screen" and call.video_mode != "screen":     # 开屏幕共享：记下摄像头原来的模式
-                    call.camera_mode, call.video_mode = call.video_mode, "screen"
-                    call.screen_buf, call.screen_story_at = [], 0.0
-                elif not on and call.video_mode == "screen":                     # 关屏幕共享：回到摄像头原来的模式
-                    call.video_mode = call.camera_mode
-                if on != call.video or source == "screen":
-                    call.video = on
-                    call.companion_reset()
-                    if not on:
-                        remove_eye_file()
-                    await send(ws, {"type": "video", "on": on, "source": source, "eyes": call.eyes.enabled, "mode": call.video_mode})
-                    await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": on, "source": source,
-                                                "mode": call.video_mode, "frame": EYE_FILE if on else None,
-                                                **({"text": companion_intro(call.video_mode, call.watch_title)} if on and call.video_mode in ("companion", "screen") else {})})
-            elif kind == "watch":
-                # 一起看电影：{"type":"watch","title":"片名"}；title 空 = 不看了，回到普通屏幕共享
-                title = str(event.get("title") or "").strip()[:60]
-                if title != call.watch_title:
-                    call.watch_title = title
-                    call.screen_buf, call.screen_story_at = [], 0.0
-                    await send(ws, {"type": "watch", "title": title})
-                    if call.video and call.video_mode == "screen":
-                        await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": True, "source": "screen",
-                                                    "mode": "screen", "frame": EYE_FILE, "text": companion_intro("screen", title)})
-            elif kind == "video_mode":
-                mode = "companion" if event.get("mode") == "companion" else "live"
-                if call.video_mode == "screen":           # 屏幕共享中切的是摄像头模式：记下，关了屏幕共享再用
-                    call.camera_mode = mode
-                    await send(ws, {"type": "video_mode", "mode": "screen", "camera_mode": mode})
-                elif mode != call.video_mode:
-                    call.video_mode = mode
-                    call.companion_reset()
-                    await send(ws, {"type": "video_mode", "mode": mode})
-                    if call.video:
-                        await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": True, "mode": mode,
-                                                    "frame": EYE_FILE, "text": companion_intro(mode)})
-            elif kind == "frame":
-                if not call.video:
+        try:
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    if call.active:
+                        call.audio.extend(raw)
                     continue
                 try:
-                    jpeg = base64.b64decode(event.get("data", ""))
-                except Exception:  # noqa: BLE001
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
                     continue
-                save_eye_file(jpeg)                                # 原画面永远留最新一帧给回复端自己看
-                if call.video_mode == "screen":
-                    await screen_frame(ws, call, http, jpeg)
-                elif call.video_mode == "companion":
-                    await companion_frame(ws, call, http, jpeg)
-                elif call.eyes.should_describe(jpeg):
-                    desc = await call.eyes.describe(http, jpeg)
-                    if desc and call.video:
-                        await send(ws, {"type": "observation", "content": desc})
-                        await notify_adapter(http, {"type": "saw", "call_session_id": call.id, "text": desc, "frame": EYE_FILE})
-            elif kind == "hangup":
-                remove_eye_file()
-                return
+                kind = event.get("type")
+                if kind == "start":
+                    if TOKEN and event.get("token") != TOKEN:
+                        await send(ws, {"type": "error", "error": "Unauthorized"})
+                        return
+                    old = CALLS.get(str(event.get("resume") or ""))
+                    if old is not None and not old.ended:
+                        # 断线接回：接着同一通，摄像头 / 屏幕共享 / 片名这些状态都在 old 上。
+                        # 旧连接还挂着（手机先连上新的、旧的还没断）：新连接接管，旧连接关掉、不算挂断
+                        gap = round(time.time() - old.detached_at, 1) if old.ws is None else 0.0
+                        prev, old.ws = old.ws, ws
+                        if old.end_task:
+                            old.end_task.cancel()
+                            old.end_task = None
+                        old.active, old.audio = False, bytearray()
+                        call = old
+                        if prev is not None and prev is not ws:
+                            try:
+                                await prev.close(code=4000, reason="replaced by a new connection")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening", "resumed": True,
+                                        "video": call.video, "video_mode": call.video_mode, "watch_title": call.watch_title})
+                        await notify_adapter(http, {"type": "call_resumed", "call_session_id": call.id, "gap_s": gap})
+                    else:
+                        call.ws = ws
+                        CALLS[call.id] = call
+                        await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
+                elif kind == "speech_start":
+                    call.begin_turn()
+                elif kind == "speech_end":
+                    pcm = call.end_turn()
+                    await send(ws, {"type": "state", "mode": "thinking"})
+                    await answer_turn(ws, call, http, pcm)
+                    await send(ws, {"type": "state", "mode": "listening"})
+                elif kind == "text":
+                    await send(ws, {"type": "state", "mode": "thinking"})
+                    await answer_turn(ws, call, http, b"", str(event.get("text", "")))
+                    await send(ws, {"type": "state", "mode": "listening"})
+                elif kind == "interrupt":
+                    call.generation += 1
+                    await send(ws, {"type": "interrupted"})
+                elif kind == "video":
+                    on = bool(event.get("on"))
+                    source = "screen" if event.get("source") == "screen" else "camera"
+                    if on and source == "screen" and call.video_mode != "screen":     # 开屏幕共享：记下摄像头原来的模式
+                        call.camera_mode, call.video_mode = call.video_mode, "screen"
+                        call.screen_buf, call.screen_story_at = [], 0.0
+                    elif not on and call.video_mode == "screen":                     # 关屏幕共享：回到摄像头原来的模式
+                        call.video_mode = call.camera_mode
+                    if on != call.video or source == "screen":
+                        call.video = on
+                        call.companion_reset()
+                        if not on:
+                            remove_eye_file()
+                        await send(ws, {"type": "video", "on": on, "source": source, "eyes": call.eyes.enabled, "mode": call.video_mode})
+                        await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": on, "source": source,
+                                                    "mode": call.video_mode, "frame": EYE_FILE if on else None,
+                                                    **({"text": companion_intro(call.video_mode, call.watch_title)} if on and call.video_mode in ("companion", "screen") else {})})
+                elif kind == "watch":
+                    # 一起看电影：{"type":"watch","title":"片名"}；title 空 = 不看了，回到普通屏幕共享
+                    title = str(event.get("title") or "").strip()[:60]
+                    if title != call.watch_title:
+                        call.watch_title = title
+                        call.screen_buf, call.screen_story_at = [], 0.0
+                        await send(ws, {"type": "watch", "title": title})
+                        if call.video and call.video_mode == "screen":
+                            await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": True, "source": "screen",
+                                                        "mode": "screen", "frame": EYE_FILE, "text": companion_intro("screen", title)})
+                elif kind == "video_mode":
+                    mode = "companion" if event.get("mode") == "companion" else "live"
+                    if call.video_mode == "screen":           # 屏幕共享中切的是摄像头模式：记下，关了屏幕共享再用
+                        call.camera_mode = mode
+                        await send(ws, {"type": "video_mode", "mode": "screen", "camera_mode": mode})
+                    elif mode != call.video_mode:
+                        call.video_mode = mode
+                        call.companion_reset()
+                        await send(ws, {"type": "video_mode", "mode": mode})
+                        if call.video:
+                            await notify_adapter(http, {"type": "camera", "call_session_id": call.id, "on": True, "mode": mode,
+                                                        "frame": EYE_FILE, "text": companion_intro(mode)})
+                elif kind == "frame":
+                    if not call.video:
+                        continue
+                    try:
+                        jpeg = base64.b64decode(event.get("data", ""))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    save_eye_file(jpeg)                                # 原画面永远留最新一帧给回复端自己看
+                    if call.video_mode == "screen":
+                        await screen_frame(ws, call, http, jpeg)
+                    elif call.video_mode == "companion":
+                        await companion_frame(ws, call, http, jpeg)
+                    elif call.eyes.should_describe(jpeg):
+                        desc = await call.eyes.describe(http, jpeg)
+                        if desc and call.video:
+                            await send(ws, {"type": "observation", "content": desc})
+                            await notify_adapter(http, {"type": "saw", "call_session_id": call.id, "text": desc, "frame": EYE_FILE})
+                elif kind == "hangup":
+                    explicit = True
+                    return
+        except ConnectionClosed:
+            pass                                  # 断线 / 被新连接接管：下面按情况留着等接回或什么都不做
+        finally:
+            if explicit:
+                await end_call(call, http, "hangup")
+            elif call.ws is ws and not call.ended and call.id in CALLS:
+                # 连接断了、不是挂断键：先留着这一通等接回
+                call.ws, call.detached_at, call.active = None, time.time(), False
+                call.end_task = asyncio.create_task(end_later(call))
+            # call.ws 已经是别的连接：被新连接接管了，什么都不做
 
 
 async def main() -> None:
