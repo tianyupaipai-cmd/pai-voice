@@ -12,6 +12,20 @@ const session = process.env.PAIVOICE_TMUX_SESSION || 'pai-voice';
 const token = process.env.PAIVOICE_ADAPTER_TOKEN || '';
 const pending = new Map();
 
+// Non-turn events from the realtime core (call start / dropped / resumed / end, camera, screen…).
+// Every one of them is pasted into the terminal as a single line, so the agent always knows the call state.
+function eventLine(e) {
+  const id = e.call_session_id ? ` ${String(e.call_session_id).slice(0, 8)}` : '';
+  switch (e.type) {
+    case 'call_start': return `[PaiVoice${id}] Incoming call connected. Each sentence will arrive as "[PaiVoice call turn: …]"; reply with pai-voice-reply.`;
+    case 'call_dropped': return `[PaiVoice${id}] The line dropped. If they reconnect within ${Math.round(Number(e.resume_s) || 60)}s it is the same call; otherwise a call_end follows.`;
+    case 'call_resumed': return `[PaiVoice${id}] They reconnected after ${Number(e.gap_s) || 0}s — same call, carry on.`;
+    case 'call_end': return `[PaiVoice${id}] Call ended (${e.reason || 'hangup'}).`;
+    case 'camera': return `[PaiVoice${id}] Camera ${e.on ? 'on' : 'off'}${e.source ? ` (${e.source})` : ''}.`;
+    default: return e.text ? `[PaiVoice${id} · ${e.type || 'event'}] ${String(e.text).slice(0, 1200)}` : null;
+  }
+}
+
 function tmux(...args) { return spawnSync('tmux', args, { encoding: 'utf8', timeout: 5000 }); }
 function json(response, code, body) { response.writeHead(code, { 'content-type': 'application/json' }); response.end(JSON.stringify(body)); }
 function allowed(request) {
@@ -45,6 +59,11 @@ createServer(async (request, response) => {
         pending.set(turnId, { resolve: (value) => { clearTimeout(timeout); resolve(value); } });
       });
       return json(response, 200, { reply });
+    }
+    if (request.method === 'POST' && request.url === '/event') {
+      const line = eventLine(body);
+      if (line) inject(line);
+      return json(response, 200, { ok: true, injected: Boolean(line) });
     }
     if (request.method === 'POST' && request.url === '/reply') {
       const turnId = String(body.turn_id || ''); const item = pending.get(turnId);

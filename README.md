@@ -91,6 +91,20 @@ PaiVoice 不存在对所有人都正确的一组数值。以下都必须依据�
 - [`packages/web-client/voice-call.js`](packages/web-client/voice-call.js)：无依赖浏览器通话客户端；PCM 捕获、VAD、回声抑制、流式音频队列、温和打断与实时状态事件。
 - [`packages/realtime-core/server.py`](packages/realtime-core/server.py)：可运行的 WebSocket 通话核心；供应商可替换的 ASR、Adapter 与 TTS 管线。
 - [`packages/adapters/tmux`](packages/adapters/tmux)：把已转录的话安全粘贴给用户自己掌控的 tmux 窗口，并等待其 hook 回传回复的适配器。
+- [`packages/adapters/file`](packages/adapters/file)：不碰终端，把每句话和每个通话事件追加到一个收件文件，由 Agent 自己盯着（Monitor / `tail -F`）回复的适配器。
+
+## 两种接法：递进终端 / 文件 + Monitor
+
+| 接法 | 前提 | 好处 | 要注意 |
+| --- | --- | --- | --- |
+| **递进终端**（`adapters/tmux`） | 你有一个后端能往 Agent 所在的终端里打字（这里用 tmux 粘贴 + 回车） | 不用 Agent 自己盯任何东西，不会「监视到期」；Agent 正在忙时，新的一句会在它下一次调工具时冒出来，被插话也看得到 | 需要能操作那个终端；Agent 长时间思考、中间不调工具时，要等它这一轮说完才送到 |
+| **文件 + Monitor**（`adapters/file`） | 只要 Agent 能在后台盯一个文件（例如 Claude Code 的 Monitor 跑 `tail -F`） | 不需要往终端打字的权限，最容易接 | 监视是 Agent 自己开的，有的工具会让后台监视过一阵子自动到期，忘了重开这通就没人听了 |
+
+两种接法的回复方式一样：`pai-voice-reply --turn-id … --text …`。通话事件（接通 `call_start`、断线 `call_dropped`、接回 `call_resumed`、挂断 `call_end`、摄像头、屏幕描述……）两种接法都会一条不少地交给 Agent：递进终端时每个事件贴一行，文件接法时写进同一个收件文件。
+
+对方连着说几句时：每句都会转写并各自递给回复端，不用等上一句回完；回来的话排队一句一句念完，后到的不会顶掉先到的。只有对方开口打断，才停下当时正在念的那一句。
+
+降低延迟的做法见 [docs/LATENCY.md](docs/LATENCY.md)（只写思路，不附实现）。
 
 最小本地启动：先安装 `packages/realtime-core/requirements.txt`，配置自己的服务器环境变量，再运行 `python packages/realtime-core/server.py`。默认 `mock` 模式不调用任何云服务；接入 Groq、ElevenLabs 或 OpenAI 前，请阅读 [密钥与语音隐私](docs/SECRETS.md)。
 

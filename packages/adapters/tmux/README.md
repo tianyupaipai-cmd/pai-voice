@@ -16,3 +16,7 @@ pai-voice-reply --turn-id "<turn id>" --text "<reply text>"
 ```
 
 不要将 token、终端历史或私有提示词提交进仓库。
+
+通话事件：realtime core 会把接通（`call_start`）、断线（`call_dropped`）、接回（`call_resumed`）、挂断（`call_end`）、摄像头开关、屏幕描述等 POST 到 `/event`，这个适配器把每一个都贴成一行 `[PaiVoice …]` 进终端，Agent 不会漏掉通话状态。对方连着说几句时，几轮可以同时在等回复，各自用 `--turn-id` 回就行。
+
+没办法往终端里打字的环境，改用 [`../file`](../file) 的文件 + Monitor 接法。

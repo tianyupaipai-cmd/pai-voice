@@ -175,6 +175,8 @@ class Call:
     end_task: object = None                   # 等接回的倒计时
     ended: bool = False
     watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
+    interrupts: int = 0                       # 对方开口打断的次数：只停正在念的那句，排着的照念
+    speak_lock: asyncio.Lock = field(default_factory=asyncio.Lock)   # 回复一句一句按顺序念，后到的不顶掉先到的
 
     def companion_reset(self) -> None:
         self.comp = {"present": None, "absent_since": 0.0, "left_reported": False,
@@ -339,16 +341,22 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         reply = await request_reply(http, turn)
         if not reply:
             return
-        call.generation += 1
-        generation = call.generation
-        await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
-        audio = await synthesize(http, reply)
-        if audio and generation == call.generation:
-            await send(call.ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
-            await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
-        await send(call.ws, {"type": "generation_end", "generation_id": generation})
+        # 不掐掉：对方连着说了几句，每句各自去问回复端；回来的话排队，按到达顺序一句一句念完。
+        # 只有对方开口打断（interrupt）才停——而且只停当时正在念的那句，后面排着的照念。
+        async with call.speak_lock:
+            heard = call.interrupts
+            call.generation += 1
+            generation = call.generation
+            await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
+            audio = await synthesize(http, reply)
+            if audio and call.interrupts == heard:
+                await send(call.ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
+                await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
+            await send(call.ws, {"type": "generation_end", "generation_id": generation})
     except Exception as error:  # do not serialize credentials or provider bodies
         await send(call.ws, {"type": "error", "error": str(error)})
+    finally:
+        await send(call.ws, {"type": "state", "mode": "listening"})
 
 
 async def session(ws) -> None:
@@ -393,18 +401,19 @@ async def session(ws) -> None:
                         call.ws = ws
                         CALLS[call.id] = call
                         await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
+                        await notify_adapter(http, {"type": "call_start", "call_session_id": call.id})   # 来电接通：先告诉回复端
                 elif kind == "speech_start":
                     call.begin_turn()
                 elif kind == "speech_end":
                     pcm = call.end_turn()
                     await send(ws, {"type": "state", "mode": "thinking"})
-                    await answer_turn(ws, call, http, pcm)
-                    await send(ws, {"type": "state", "mode": "listening"})
+                    # 不等这轮回完：对方接着说的下一句照样转写、照样递给回复端（以前要等上一轮回完才收下一句）
+                    asyncio.create_task(answer_turn(ws, call, http, pcm))
                 elif kind == "text":
                     await send(ws, {"type": "state", "mode": "thinking"})
-                    await answer_turn(ws, call, http, b"", str(event.get("text", "")))
-                    await send(ws, {"type": "state", "mode": "listening"})
+                    asyncio.create_task(answer_turn(ws, call, http, b"", str(event.get("text", ""))))
                 elif kind == "interrupt":
+                    call.interrupts += 1
                     call.generation += 1
                     await send(ws, {"type": "interrupted"})
                 elif kind == "video":
@@ -472,9 +481,13 @@ async def session(ws) -> None:
             if explicit:
                 await end_call(call, http, "hangup")
             elif call.ws is ws and not call.ended and call.id in CALLS:
-                # 连接断了、不是挂断键：先留着这一通等接回
+                # 连接断了、不是挂断键：先留着这一通等接回，并马上告诉回复端（没接回再报 call_end）
                 call.ws, call.detached_at, call.active = None, time.time(), False
                 call.end_task = asyncio.create_task(end_later(call))
+                try:
+                    await notify_adapter(http, {"type": "call_dropped", "call_session_id": call.id, "resume_s": RESUME_WINDOW})
+                except Exception:  # noqa: BLE001
+                    pass
             # call.ws 已经是别的连接：被新连接接管了，什么都不做
 
 

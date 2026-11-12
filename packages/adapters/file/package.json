@@ -1,0 +1,6 @@
+{
+  "name": "@pai-voice/file-adapter",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" }
+}
